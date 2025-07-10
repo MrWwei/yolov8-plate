@@ -5,6 +5,7 @@ import argparse
 import copy
 import time
 import os
+from ultralytics import YOLO
 from ultralytics.nn.tasks import  attempt_load_weights
 from plate_recognition.plate_rec import get_plate_result,init_model,cv_imread
 from plate_recognition.double_plate_split_merge import get_split_merge
@@ -142,6 +143,8 @@ def det_rec_plate(img,img_ori,detect_model,plate_rec_model):
         # roi_img = four_point_transform(img_ori,land_marks)   #透视变换得到车牌小图
         if int(label):        #判断是否是双层车牌，是双牌的话进行分割后然后拼接
             roi_img=get_split_merge(roi_img)
+        if roi_img.shape[0] == 0 or roi_img.shape[1] == 0:
+            continue
         plate_number,rec_prob,plate_color,color_conf=get_plate_result(roi_img,device,plate_rec_model,is_color=True)
         
         result_dict['plate_no']=plate_number   #车牌号
@@ -195,6 +198,22 @@ def draw_result(orgimg,dict_list,is_color=False):   # 车牌结果画出来
                
     print(result_str)
     return orgimg
+def detect_car_person(frame, model):
+    
+    results = model(frame, imgsz=640, conf=0.3, iou=0.2, classes=[0, 2, 5, 7])
+    result_img = results[0].plot(labels=False, line_width=1)
+    return results[0].boxes
+   
+
+    # 遍历检测框，裁剪车辆（car=2, bus=5, truck=7）
+    boxes = results[0].boxes
+    for i, box in enumerate(boxes):
+        cls_id = int(box.cls[0])
+        if cls_id in [2, 5, 7]:  # 只裁剪车辆
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            crop = frame[y1:y2, x1:x2]
+            crop_filename = os.path.join(crop_dir, f"frame{frame_idx:06d}_car{i}_cls{cls_id}.jpg")
+            cv2.imwrite(crop_filename, crop)
 
 
 if __name__ == "__main__":
@@ -213,6 +232,7 @@ if __name__ == "__main__":
     if not os.path.exists(save_path): 
         os.mkdir(save_path)
         
+    car_person_model = YOLO("yolo11m.pt")
     detect_model = load_model(opt.detect_model, device)  #初始化yolov8识别模型
     plate_rec_model=init_model(device,opt.rec_model,is_color=True)      #初始化识别模型
     #算参数量
@@ -221,27 +241,103 @@ if __name__ == "__main__":
     print("yolov8 detect params: %.2fM,rec params: %.2fM" % (total/1e6,total_1/1e6))
     
     detect_model.eval() 
-    # print(detect_model)
-    file_list = []
-    allFilePath(opt.image_path,file_list)
-    count=0
-    time_all = 0
-    time_begin=time.time()
-    for pic_ in file_list:
-        print(count,pic_,end=" ")
-        time_b = time.time()               #开始时间
-        img = cv2.imread(pic_)
-        img_ori = copy.deepcopy(img)
-        result_list=det_rec_plate(img,img_ori,detect_model,plate_rec_model)
-        time_e=time.time()
-        ori_img=draw_result(img,result_list)  #将结果画在图上
-        img_name = os.path.basename(pic_)  
-        save_img_path = os.path.join(save_path,img_name)  #图片保存的路径
-        time_gap = time_e-time_b                         #计算单个图片识别耗时
-        if count:
-            time_all+=time_gap 
-        count+=1
-        cv2.imwrite(save_img_path,ori_img)               #op
-        # print(result_list)
-    print(f"sumTime time is {time.time()-time_begin} s, average pic time is {time_all/(len(file_list)-1)}")
+
+    # 输入视频路径
+    video_path = "/home/ubuntu/Desktop/DJI_20250501092710_0014_V4k.MP4"  # 替换为你的视频文件路径
+    save_path = "results/DJI_20250501092710_0014_V4k_show.mp4"  # 输出视频路径
+    crop_dir = "results/crops"  # 保存车辆切图的文件夹
+
+    # 创建保存目录
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    os.makedirs(crop_dir, exist_ok=True)
+
+    # 打开视频
+    cap = cv2.VideoCapture(video_path)
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    out = cv2.VideoWriter(save_path, fourcc, fps, (width, height))
+
+    frame_idx = 0
+    while cap.isOpened():
+        frame_idx += 1
+
+        ret, frame = cap.read()
+        if not ret:
+            break
+        boxes = detect_car_person(frame, car_person_model)
+        plate_results = []
+        # 先画所有车辆和人的识别框
+        for i, box in enumerate(boxes):
+            cls_id = int(box.cls[0])
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            color = (0, 0, 255) if cls_id == 0 else (0, 255, 0)  # 人绿色，车蓝色
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            if cls_id in [2, 5, 7]:  # 只裁剪车辆
+                crop = frame[y1:y2, x1:x2]
+                img_ori = copy.deepcopy(crop)
+                result_list = det_rec_plate(crop, img_ori, detect_model, plate_rec_model)
+                # 坐标还原到大图
+                for result in result_list:
+                    rect = result['rect']
+                    result['rect'] = [
+                        rect[0] + x1,
+                        rect[1] + y1,
+                        rect[2] + x1,
+                        rect[3] + y1
+                    ]
+                    plate_results.append(result)
+                    # 将车牌roi区域抠图放大，显示到原图车辆识别框中间
+                    roi = crop[result['rect'][1]-y1:result['rect'][3]-y1, result['rect'][0]-x1:result['rect'][2]-x1]
+                    if roi.shape[0] > 0 and roi.shape[1] > 0:
+                        scale = 2.0  # 放大倍数
+                        roi_h, roi_w = roi.shape[:2]
+                        roi_resized = cv2.resize(roi, (int(roi_w*scale), int(roi_h*scale)))
+                        # 计算放置位置（车辆框中间）
+                        center_x = x1 + (x2 - x1) // 2
+                        center_y = y1 + (y2 - y1) // 2
+                        top_left_x = center_x - roi_resized.shape[1] // 2
+                        top_left_y = center_y - roi_resized.shape[0] // 2
+                        # 边界检查
+                        top_left_x = max(0, min(top_left_x, frame.shape[1] - roi_resized.shape[1]))
+                        top_left_y = max(0, min(top_left_y, frame.shape[0] - roi_resized.shape[0]))
+                        # 覆盖显示
+                        frame[top_left_y:top_left_y+roi_resized.shape[0], top_left_x:top_left_x+roi_resized.shape[1]] = roi_resized
+        # 将所有车牌结果画在大图上
+        frame_with_plate = draw_result(frame, plate_results)
+        out.write(frame_with_plate)
+        cv2.namedWindow("Detection", cv2.WINDOW_NORMAL)
+        cv2.imshow("Detection", frame_with_plate)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+        print("frame idx:{}", frame_idx)
+
+
+
+
+
+    # # print(detect_model)
+    # file_list = []
+    # allFilePath(opt.image_path,file_list)
+    # count=0
+    # time_all = 0
+    # time_begin=time.time()
+    # for pic_ in file_list:
+    #     print(count,pic_,end=" ")
+    #     time_b = time.time()               #开始时间
+    #     img = cv2.imread(pic_)
+    #     img_ori = copy.deepcopy(img)
+    #     result_list=det_rec_plate(img,img_ori,detect_model,plate_rec_model)
+    #     time_e=time.time()
+    #     ori_img=draw_result(img,result_list)  #将结果画在图上
+    #     img_name = os.path.basename(pic_)  
+    #     save_img_path = os.path.join(save_path,img_name)  #图片保存的路径
+    #     time_gap = time_e-time_b                         #计算单个图片识别耗时
+    #     if count:
+    #         time_all+=time_gap 
+    #     count+=1
+    #     cv2.imwrite(save_img_path,ori_img)               #op
+    #     # print(result_list)
+    # print(f"sumTime time is {time.time()-time_begin} s, average pic time is {time_all/(len(file_list)-1)}")
      
